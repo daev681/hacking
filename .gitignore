@@ -21,10 +21,10 @@ bin/
 /dist/
 /nbdist/
 /.nb-gradle/
-
+*.txt
 ### VS Code ###
 .vscode/
-
+*target*
 ### Mac OS ###
 .DS_Store### Java template
 # Compiled class file
